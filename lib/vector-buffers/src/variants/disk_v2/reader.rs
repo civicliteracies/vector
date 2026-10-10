@@ -1219,11 +1219,17 @@ where
         };
         self.track_read(record_id, record_bytes, record_events);
 
-        let (batch, receiver) = BatchNotifier::new_with_receiver();
-        record.add_batch_notifier(batch);
-        self.finalizer.add(record_events.get(), receiver);
-
+        // Only a record that `track_read` registered a marker for may produce an
+        // acknowledgement. During initialization, `seek_to_next_record` replays records that were
+        // already acknowledged before the checkpoint and discards them; they have no marker in
+        // `record_acks`, so an acknowledgement from one would sit there as unclaimed credit and
+        // later be claimed by records read after the checkpoint, marking them delivered (and
+        // advancing the durable checkpoint past them) while they are still in flight.
         if self.ready_to_read {
+            let (batch, receiver) = BatchNotifier::new_with_receiver();
+            record.add_batch_notifier(batch);
+            self.finalizer.add(record_events.get(), receiver);
+
             trace!(
                 record_id,
                 record_events,
