@@ -374,7 +374,7 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
 
         // If the given buffer is too large to be buffered at all, then bypass the internal buffer.
         if buf.len() >= self.buf.capacity() {
-            self.inner.write_all(buf).await?;
+            Self::write_through(&mut self.inner, buf).await?;
 
             let flush_result = flush_result.get_or_insert(FlushResult::default());
             flush_result.events_flushed += event_count as u64;
@@ -408,7 +408,7 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
         let events_flushed = self.unflushed_events as u64;
         let bytes_flushed = self.buf.len() as u64;
 
-        let result = self.inner.write_all(&self.buf[..]).await;
+        let result = Self::write_through(&mut self.inner, &self.buf[..]).await;
         self.unflushed_events = 0;
         self.buf.clear();
 
@@ -418,6 +418,18 @@ impl<W: AsyncWrite + Unpin> TrackingBufWriter<W> {
                 bytes_flushed,
             })
         })
+    }
+
+    /// Writes the given bytes to the inner writer and waits for them to land there.
+    ///
+    /// The caller reports these bytes as flushed, and the reader is then woken to read them from
+    /// the data file. A writer may accept a write and carry it out later (a `tokio::fs::File` runs
+    /// it on a blocking thread after `write` has returned), so the bytes are only readable once the
+    /// inner writer's own flush has completed. Without it, a woken reader can find the file still
+    /// empty, and nothing wakes it again until the next record is flushed.
+    async fn write_through(inner: &mut W, bytes: &[u8]) -> io::Result<()> {
+        inner.write_all(bytes).await?;
+        inner.flush().await
     }
 
     /// Gets a reference to the underlying writer.
