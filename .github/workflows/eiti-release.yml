@@ -1,0 +1,140 @@
+name: eiti-release
+
+# Builds this branch's Vector (an upstream release with the patches eiti/README.md describes) and
+# publishes it as a release of this repository.
+#
+# Runs when a tag named <upstream version>-eiti.<n> is pushed (0.58.0-eiti.1): the tag is the
+# release's name and fixes the commit the release was built from. Upstream's own release workflow
+# runs on tags that start with `v`; this branch holds no workflow but this one, so a push to it
+# runs nothing else.
+#
+# Each target is built on a runner of its own architecture by eiti/build.sh, which first runs the
+# tests that come with the patches and stops when one fails or is missing. The release is created
+# only when every target was built, so a published release holds a build for each.
+on:
+  push:
+    tags: ["*-eiti.*"]
+
+# One run per tag, never cancelled.
+concurrency:
+  group: eiti-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  targets:
+    # The targets eiti/build.sh builds, as the build job's matrix, once the tag is known to name
+    # the version this commit is.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      targets: ${{ steps.read.outputs.targets }}
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag and read the targets
+        id: read
+        run: |
+          version="$(./eiti/build.sh --version)"
+          if ! [[ "${GITHUB_REF_NAME}" =~ ^${version//./\\.}-eiti\.[1-9][0-9]*$ ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not name a build of Vector ${version} (expected ${version}-eiti.<n>)"
+            exit 1
+          fi
+          matrix="$(./eiti/build.sh --targets | jq --raw-input --null-input --compact-output '[inputs]')"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "targets=${matrix}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: targets
+    strategy:
+      matrix:
+        target: ${{ fromJSON(needs.targets.outputs.targets) }}
+    # The runner of each target's architecture: a target with no runner here has no label to run
+    # on, and its job fails.
+    runs-on: >-
+      ${{ fromJSON('{"x86_64-unknown-linux-gnu": "ubuntu-24.04", "aarch64-unknown-linux-gnu": "ubuntu-24.04-arm"}')[matrix.target] }}
+    timeout-minutes: 180
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v9.0.0
+
+      - name: Install protoc
+        timeout-minutes: 12
+        run: |
+          sudo apt-get -o DPkg::Lock::Timeout=300 update -qq
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y -qq protobuf-compiler
+
+      - name: Test the patches and build Vector
+        # The patches' tests, then a release build of Vector (thin LTO, which fits a standard
+        # runner's memory), then the checks of the binary it built.
+        timeout-minutes: 150
+        run: ./eiti/build.sh "${TARGET}"
+
+      - name: Keep the tarball for the release
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v7
+        with:
+          name: vector-${{ matrix.target }}
+          path: target/eiti/vector-*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [targets, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.targets.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch every target's tarball
+        timeout-minutes: 5
+        uses: actions/download-artifact@v7
+        with:
+          pattern: vector-*
+          path: release
+          merge-multiple: true
+
+      - name: Write the checksums
+        # One file, named and laid out as upstream names and lays out its own
+        # (vector-<version>-SHA256SUMS, a `sha256sum` line per tarball), so whatever verifies an
+        # upstream release against its checksum file verifies this one the same way. A target
+        # with no tarball here fails the step: the release would lack a build.
+        timeout-minutes: 5
+        run: |
+          cd release
+          for target in $("${GITHUB_WORKSPACE}/eiti/build.sh" --targets); do
+            test -f "vector-${VERSION}-${target}.tar.gz" || { echo "::error::no tarball for ${target}"; exit 1; }
+          done
+          sha256sum vector-"${VERSION}"-*.tar.gz > "vector-${VERSION}-SHA256SUMS"
+          cat "vector-${VERSION}-SHA256SUMS"
+
+      - name: Publish the release
+        # Created as a draft, which holds every file before anyone can read it, then published:
+        # a release that is visible is complete. A draft an earlier attempt of this job left for
+        # the tag is deleted first: GitHub allows several drafts for one tag, and publishing would
+        # pick one of them. A published release of the tag makes the create fail: a new build is a
+        # new tag.
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq ".[] | select(.draft and .tag_name == \"${GITHUB_REF_NAME}\") | .id" |
+            while IFS= read -r left; do
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${left}"
+            done
+          gh release create "${GITHUB_REF_NAME}" --draft --verify-tag --title "${GITHUB_REF_NAME}" \
+            --notes "Vector ${VERSION} with the patches eiti/README.md describes at this tag, built on each target by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}." \
+            release/*
+          gh release edit "${GITHUB_REF_NAME}" --draft=false
