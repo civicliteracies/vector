@@ -62,6 +62,24 @@ where
             },
         }
     }
+
+    /// Waits until every item this receiver returned has been acknowledged, once `next` has
+    /// returned `None`.
+    ///
+    /// An in-memory channel holds no record of what it returned, so it has nothing to wait for.
+    /// A disk buffer's reader applies acknowledgements to its ledger, and records left
+    /// unacknowledged when it is dropped are read again when the buffer is reopened. An I/O error
+    /// there is unrecoverable, as it is to `next`.
+    pub(crate) async fn settle(&mut self) {
+        match self {
+            ReceiverAdapter::InMemory(_) => {}
+            ReceiverAdapter::DiskV2(reader) => {
+                if let Err(e) = reader.settle().await {
+                    panic!("Reader encountered unrecoverable error: {e:?}");
+                }
+            }
+        }
+    }
 }
 
 /// A buffer receiver.
@@ -152,6 +170,20 @@ impl<T: Bufferable> BufferReceiver<T> {
         Some(item)
     }
 
+    /// Waits until every item this receiver and its overflow returned has been acknowledged.
+    ///
+    /// Call this once `next` has returned `None`. A disk buffer ends its reader's input as soon as
+    /// the writer is done and every record has been read, while the records it returned may still
+    /// be unacknowledged; acknowledgements reach its ledger only through its reader, so a receiver
+    /// dropped without settling leaves those records to be read again when the buffer is reopened.
+    #[async_recursion]
+    pub async fn settle(&mut self) {
+        self.base.settle().await;
+        if let Some(overflow) = self.overflow.as_mut() {
+            overflow.settle().await;
+        }
+    }
+
     pub fn into_stream(self) -> BufferReceiverStream<T> {
         BufferReceiverStream::new(self)
     }
@@ -161,7 +193,9 @@ impl<T: Bufferable> BufferReceiver<T> {
 enum StreamState<T: Bufferable> {
     Idle(BufferReceiver<T>),
     Polling,
-    Closed,
+    /// The receiver returned `None`. It is kept so that [`BufferReceiverStream::settle`] can wait
+    /// for the acknowledgements of the items it returned.
+    Ended(BufferReceiver<T>),
 }
 
 pub struct BufferReceiverStream<T: Bufferable> {
@@ -176,6 +210,19 @@ impl<T: Bufferable> BufferReceiverStream<T> {
             recv_fut: ReusableBoxFuture::new(make_recv_future(None)),
         }
     }
+
+    /// Waits until every item the stream returned has been acknowledged, if the stream has ended.
+    ///
+    /// A consumer that read the stream to its end calls this before dropping the stream, after it
+    /// has delivered or dropped every item: a disk buffer ends the stream once its writer is done
+    /// and every record has been read, and applies the acknowledgements of the records it returned
+    /// only while its reader is alive. A stream that has not ended is left as it is: its reader
+    /// applies those acknowledgements when it is read again.
+    pub async fn settle(&mut self) {
+        if let StreamState::Ended(receiver) = &mut self.state {
+            receiver.settle().await;
+        }
+    }
 }
 
 impl<T: Bufferable> Stream for BufferReceiverStream<T> {
@@ -184,7 +231,7 @@ impl<T: Bufferable> Stream for BufferReceiverStream<T> {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             match mem::replace(&mut self.state, StreamState::Polling) {
-                s @ StreamState::Closed => {
+                s @ StreamState::Ended(_) => {
                     self.state = s;
                     return Poll::Ready(None);
                 }
@@ -194,7 +241,7 @@ impl<T: Bufferable> Stream for BufferReceiverStream<T> {
                 StreamState::Polling => {
                     let (result, receiver) = ready!(self.recv_fut.poll(cx));
                     self.state = if result.is_none() {
-                        StreamState::Closed
+                        StreamState::Ended(receiver)
                     } else {
                         StreamState::Idle(receiver)
                     };

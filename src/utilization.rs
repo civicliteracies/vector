@@ -63,6 +63,11 @@ impl<S> Utilization<S> {
     pub(crate) fn into_inner(self) -> S {
         self.inner
     }
+
+    /// Returns the inner stream.
+    pub(crate) const fn get_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
 }
 
 impl<S> Stream for Utilization<S>

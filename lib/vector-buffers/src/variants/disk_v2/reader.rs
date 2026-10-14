@@ -434,6 +434,9 @@ where
     data_file_record_count: u64,
     data_file_marked_record_count: u64,
     ready_to_read: bool,
+    /// Bytes of the records this reader has returned that are not yet acknowledged. They still
+    /// count toward the ledger's total buffer size, but there is nothing left to read for them.
+    unacked_read_bytes: u64,
     record_acks: OrderedAcknowledgements<u64, u64>,
     data_file_acks: OrderedAcknowledgements<u64, ()>,
     finalizer: OrderedFinalizer<u64>,
@@ -461,6 +464,7 @@ where
             data_file_record_count: 0,
             data_file_marked_record_count: 0,
             ready_to_read: false,
+            unacked_read_bytes: 0,
             record_acks: OrderedAcknowledgements::from_acked(next_expected_record_id),
             data_file_acks: OrderedAcknowledgements::from_acked(0),
             finalizer,
@@ -541,6 +545,10 @@ where
                 }
             }
         }
+        self.unacked_read_bytes = self
+            .unacked_read_bytes
+            .checked_add(record_bytes)
+            .expect("unacknowledged read bytes are bounded by the buffer's size, a u64");
     }
 
     fn track_dropped_read(&mut self, record_bytes: u64) {
@@ -670,6 +678,11 @@ where
             if had_eligible_records {
                 self.ledger
                     .track_reads(events_acknowledged, bytes_acknowledged);
+                // Every acknowledged marker was added by `track_read`, which counted its bytes.
+                self.unacked_read_bytes = self
+                    .unacked_read_bytes
+                    .checked_sub(bytes_acknowledged)
+                    .expect("acknowledged bytes are bytes of records this reader returned");
 
                 // We need to account for skipped events, too, so that our "last reader record ID"
                 // value stays correct as we process these gap markers.
@@ -996,8 +1009,10 @@ where
 
     /// Reads a record.
     ///
-    /// If the writer is closed and there is no more data in the buffer, `None` is returned.
-    /// Otherwise, reads the next record or waits until the next record is available.
+    /// If the writer is closed and every record in the buffer has been read, `None` is returned,
+    /// whether or not the records already returned have been acknowledged; [`Self::settle`] then
+    /// waits for their acknowledgements. Otherwise, reads the next record or waits until the next
+    /// record is available.
     ///
     /// # Errors
     ///
@@ -1024,21 +1039,23 @@ where
                 break token;
             }
 
-            // If the writer has marked themselves as done, and the buffer has been emptied, then
-            // we're done and can return.  We have to look at something besides simply the writer
-            // being marked as done to know if we're actually done or not, and "buffer size" is better
-            // than "total records" because buffer size is decremented when records are acknowledged
-            // and when the reader abandons a bad tail.
+            // If the writer has marked themselves as done, and every byte left in the buffer
+            // belongs to a record this reader has already returned, then nothing is left to read
+            // and we're done, even while those records wait to be acknowledged: a caller may hold
+            // them until its input ends (a sink's open batch does), so waiting for their
+            // acknowledgements here would wait on ourselves. `settle` waits for them instead.
             //
-            // If we used "total records", we could end up stuck in cases where we skipped
-            // corrupted records, but hadn't yet had a "good" record that we could read, since the
-            // "we skipped records due to corruption" logic requires performing valid read to
-            // detect, and calculate a valid delta from.
-            if self.ledger.is_writer_done() {
-                let total_buffer_size = self.ledger.get_total_buffer_size();
-                if total_buffer_size == 0 {
-                    return Ok(None);
-                }
+            // The writer publishes a record's bytes to the ledger before marking itself done, so
+            // a record flushed just before the close is still counted here and read. We compare
+            // bytes rather than records because the buffer size is also decremented when the
+            // reader drops a corrupted record or abandons a bad tail; with "total records", we
+            // could end up stuck when corrupted records were skipped, since detecting the skip
+            // requires a valid read to calculate a delta from. The comparison is `<=` so that it
+            // holds whenever an empty buffer does: a reader ends no later than at a size of zero.
+            if self.ledger.is_writer_done()
+                && self.ledger.get_total_buffer_size() <= self.unacked_read_bytes
+            {
+                return Ok(None);
             }
 
             self.ensure_ready_for_read().await.context(IoSnafu)?;
@@ -1240,6 +1257,36 @@ where
         }
 
         Ok(Some(record))
+    }
+
+    /// Waits until every record this reader returned has been acknowledged, then flushes the
+    /// ledger so the reader checkpoint is durable.
+    ///
+    /// Call this once `next` has returned `None`. At that point the writer is done and every
+    /// record has been read, but records `next` returned may still be unacknowledged, and only
+    /// this reader applies acknowledgements to the ledger: a reader dropped before they are applied
+    /// leaves those records in the buffer, and they are read again when the buffer is reopened.
+    /// This waits for as long as any returned record is still held, so the caller must have
+    /// delivered or dropped every record it read.
+    ///
+    /// # Errors
+    ///
+    /// If an I/O error occurs while applying acknowledgements (flushing the data file checkpoint) or
+    /// flushing the ledger, it is returned.
+    #[cfg_attr(test, instrument(skip(self), level = "debug"))]
+    pub async fn settle(&mut self) -> io::Result<()> {
+        loop {
+            self.handle_pending_acknowledgements(false)?;
+            if self.unacked_read_bytes == 0 {
+                break;
+            }
+
+            // The finalizer wakes writer waiters after recording each acknowledgement, and the
+            // notification is kept if it arrives before we wait, so none is missed.
+            self.ledger.wait_for_writer().await;
+        }
+
+        self.ledger.flush()
     }
 }
 

@@ -10,8 +10,8 @@ use vector_lib::{
 
 use self::{
     sinks::{
-        BackpressureSinkConfig, BasicSinkConfig, ErrorSinkConfig, OneshotSinkConfig,
-        PanicSinkConfig,
+        BackpressureSinkConfig, BasicSinkConfig, ErrorSinkConfig, HoldingSinkConfig,
+        OneshotSinkConfig, PanicSinkConfig,
     },
     sources::{
         BackpressureSourceConfig, BasicSourceConfig, ErrorSourceConfig, PanicSourceConfig,
@@ -79,6 +79,15 @@ pub fn basic_sink(channel_size: usize) -> (impl Stream<Item = SourceSenderItem>,
     let (tx, rx) = SourceSender::new_test_sender_with_options(channel_size, None);
     let sink = BasicSinkConfig::new(tx, true);
     (rx.into_stream(), sink)
+}
+
+/// A sink that forwards each event as it reads it and acknowledges its events only once its input
+/// has ended (`HoldingSinkConfig`).
+pub fn holding_sink(
+    channel_size: usize,
+) -> (impl Stream<Item = SourceSenderItem>, HoldingSinkConfig) {
+    let (tx, rx) = SourceSender::new_test_sender_with_options(channel_size, None);
+    (rx.into_stream(), HoldingSinkConfig::new(tx))
 }
 
 pub fn basic_sink_with_data(

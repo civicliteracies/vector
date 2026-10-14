@@ -382,15 +382,17 @@ impl ReaderModel {
     }
 
     fn done_overall(&mut self) -> bool {
-        let reader_file_id = self.ledger.get_reader_file_id();
-        let writer_file_id = self.ledger.get_writer_file_id();
-        let writer_done = self.ledger.is_writer_done();
-        let buffer_empty = self.ledger.get_buffer_size() == 0;
+        // The buffer size counts every flushed record until it is acknowledged, and the records
+        // read but not yet acknowledged are exactly those still awaiting acknowledgement. When the
+        // two are equal, every flushed record has been read: nothing is left to read, even though
+        // records read may still be unacknowledged.
+        let unacked_read_bytes = self
+            .pending_record_acks
+            .iter()
+            .map(|(_, record_bytes)| record_bytes)
+            .sum::<u64>();
 
-        self.done_with_current_file()
-            && buffer_empty
-            && writer_done
-            && reader_file_id == writer_file_id
+        self.ledger.is_writer_done() && self.ledger.get_buffer_size() == unacked_read_bytes
     }
 
     fn check_ready(&mut self) -> bool {
@@ -417,14 +419,15 @@ impl ReaderModel {
             // Try and process acknowledgements before anything else.
             self.handle_acks();
 
+            // If the writer is all done, and we've read everything it flushed, then we have no more
+            // records to read.
+            if self.done_overall() {
+                return Progress::RecordRead(None);
+            }
+
             // If we can't open our desired current data file, we wait.
             if !self.check_ready() {
                 return Progress::Blocked;
-            }
-
-            // If the writer is all done, and we've caught up to it, then we have no more records to read.
-            if self.done_overall() {
-                return Progress::RecordRead(None);
             }
 
             let current_file = self.current_file.as_ref().unwrap();

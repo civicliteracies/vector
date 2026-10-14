@@ -753,26 +753,39 @@ impl<'a> Builder<'a> {
             let mut rx = Utilization::new(utilization_sender, component_key.clone(), rx);
 
             let events_received = register!(EventsReceived);
-            sink.run(
-                rx.by_ref()
-                    .filter(|events: &EventArray| ready(filter_events_type(events, input_type)))
-                    .inspect(|events| {
-                        events_received.emit(CountByteSize(
-                            events.len(),
-                            events.estimated_json_encoded_size_of(),
-                        ))
-                    })
-                    .take_until_if(tripwire),
-            )
-            .await
-            .map(|_| {
-                debug!("Sink finished normally.");
-                TaskOutput::Sink(rx)
-            })
-            .map_err(|_| {
-                debug!("Sink finished with an error.");
-                TaskError::Opaque
-            })
+            let result = sink
+                .run(
+                    rx.by_ref()
+                        .filter(|events: &EventArray| ready(filter_events_type(events, input_type)))
+                        .inspect(|events| {
+                            events_received.emit(CountByteSize(
+                                events.len(),
+                                events.estimated_json_encoded_size_of(),
+                            ))
+                        })
+                        .take_until_if(tripwire),
+                )
+                .await;
+            match result {
+                Ok(()) => {
+                    // A sink that finished normally has delivered or dropped every event it
+                    // read. A disk buffer ends its input before the acknowledgements of those
+                    // events reach its ledger, so wait for them here, before the buffer's reader
+                    // can be dropped; without this they would be read again at the next start.
+                    // A sink stopped by its tripwire has not ended its input: settling leaves its
+                    // reader as it is, to apply the acknowledgements when it is read again.
+                    rx.get_mut().settle().await;
+                    debug!("Sink finished normally.");
+                    Ok(TaskOutput::Sink(rx))
+                }
+                // Not settled: a sink that fails drops the requests it had in flight, and dropped
+                // events count as delivered, so settling would acknowledge records that were
+                // never sent. Unsettled, they are read again at the next start.
+                Err(()) => {
+                    debug!("Sink finished with an error.");
+                    Err(TaskError::Opaque)
+                }
+            }
         };
 
         let task = Task::new(key.clone(), typetag, sink);

@@ -25,7 +25,7 @@ use crate::{
         mock::{
             basic_sink, basic_sink_failing_healthcheck, basic_sink_with_data, basic_source,
             basic_source_with_data, basic_source_with_event_counter, basic_transform,
-            error_definition_transform,
+            error_definition_transform, holding_sink,
         },
         start_topology, trace_init,
     },
@@ -876,6 +876,70 @@ async fn topology_disk_buffer_flushes_on_idle() {
     // make sure there are no unexpected stragglers
     let rest = out1.collect::<Vec<_>>().await;
     assert!(rest.is_empty());
+}
+
+/// A sink that holds its events until its input ends, as a batching sink holds its open batch,
+/// reads from a disk buffer. A stop ends the sink's input once every event has been read, though
+/// none is acknowledged yet, and the events the sink then delivers leave the buffer: the buffer's
+/// next run reads none of them again.
+#[tokio::test]
+async fn topology_disk_buffer_ends_a_holding_sink_s_input_at_stop() {
+    trace_init();
+
+    let tmpdir = tempfile::tempdir().expect("no tmpdir");
+    let disk_buffer = || {
+        BufferConfig::Single(BufferType::DiskV2 {
+            max_size: std::num::NonZeroU64::new(268435488).unwrap(),
+            when_full: WhenFull::Block,
+        })
+    };
+
+    let (mut in1, source1) = basic_source();
+    let (mut out1, sink1) = holding_sink(10);
+    let mut config = Config::builder();
+    config.set_data_dir(tmpdir.path());
+    config.add_source("in1", source1);
+    let mut sink1_outer = SinkOuter::new(vec![String::from("in1")], sink1);
+    sink1_outer.buffer = disk_buffer();
+    config.add_sink_outer("out1", sink1_outer);
+    let (topology, _) = start_topology(config.build().unwrap(), false).await;
+
+    for message in ["one", "two", "three"] {
+        in1.send_event(Event::Log(LogEvent::from(message)))
+            .await
+            .unwrap();
+    }
+    let mut read = Vec::new();
+    for _ in 0..3 {
+        let array = tokio::time::timeout(Duration::from_secs(1), out1.next())
+            .await
+            .expect("the sink should read each event as it is sent")
+            .expect("no output");
+        read.extend(array.into_events().map(into_message));
+    }
+    assert_eq!(read, ["one", "two", "three"]);
+
+    tokio::time::timeout(Duration::from_secs(10), topology.stop())
+        .await
+        .expect("the stop should end the sink's input once every event has been read");
+
+    // The same sink key reopens the same disk buffer.
+    let (_in2, source2) = basic_source();
+    let (out2, sink2) = basic_sink(10);
+    let mut config = Config::builder();
+    config.set_data_dir(tmpdir.path());
+    config.add_source("in1", source2);
+    let mut sink2_outer = SinkOuter::new(vec![String::from("in1")], sink2);
+    sink2_outer.buffer = disk_buffer();
+    config.add_sink_outer("out1", sink2_outer);
+    let (topology, _) = start_topology(config.build().unwrap(), false).await;
+    topology.stop().await;
+
+    let read_again = out2.collect::<Vec<_>>().await;
+    assert!(
+        read_again.is_empty(),
+        "the first run delivered every event, so its buffer should hold none of them"
+    );
 }
 
 #[tokio::test]
